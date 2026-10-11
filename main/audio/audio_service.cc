@@ -218,6 +218,18 @@ void AudioService::Stop() {
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
     if (!codec_->input_enabled()) {
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < AUDIO_HW_REOPEN_MIN_HEAP) {
+            // 堆不足时不重开 codec：I2S 重配失败后 esp_codec_dev 会继续执行并空指针
+            // 崩溃。返回 false 让调用方稍后重试，等 TLS 握手临时内存释放后堆会回升。
+            static auto last_warn = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_warn > std::chrono::seconds(2)) {
+                last_warn = now;
+                ESP_LOGW(TAG, "Input reopen deferred: internal heap too low (free=%u)",
+                         heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            }
+            return false;
+        }
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         codec_->EnableInput(true);
@@ -336,6 +348,16 @@ void AudioService::AudioOutputTask() {
         lock.unlock();
 
         if (!codec_->output_enabled()) {
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < AUDIO_HW_REOPEN_MIN_HEAP) {
+                // 堆不足推迟播放而不是硬开 codec（同 ReadAudioData 的崩溃规避）
+                ESP_LOGW(TAG, "Playback deferred: internal heap too low (free=%u)",
+                         heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                std::lock_guard<std::mutex> relock(audio_queue_mutex_);
+                audio_playback_queue_.push_front(std::move(task));
+                audio_queue_cv_.notify_all();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
@@ -667,6 +689,12 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
 
 void AudioService::PlaySound(const std::string_view& ogg) {
     if (!codec_->output_enabled()) {
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < AUDIO_HW_REOPEN_MIN_HEAP) {
+            // 提示音非关键路径，堆不足时直接跳过，避免触发 I2S 重配崩溃
+            ESP_LOGW(TAG, "PlaySound skipped: internal heap too low (free=%u)",
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            return;
+        }
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         codec_->EnableOutput(true);
@@ -712,6 +740,24 @@ void AudioService::ResetDecoder() {
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
     audio_queue_cv_.notify_all();
+}
+
+void AudioService::SuspendAudioHardware() {
+    // 给输入任务一个读周期退出当前读取，避免与 codec_dev_close 并发
+    vTaskDelay(pdMS_TO_TICKS(30));
+    bool changed = false;
+    if (codec_->input_enabled()) {
+        codec_->EnableInput(false);
+        changed = true;
+    }
+    if (codec_->output_enabled()) {
+        codec_->EnableOutput(false);
+        changed = true;
+    }
+    if (changed) {
+        ESP_LOGI(TAG, "Audio hardware suspended to free internal heap (free=%u)",
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {

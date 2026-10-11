@@ -45,6 +45,11 @@
 #define MAX_TIMESTAMPS_IN_QUEUE 3
 
 #define AUDIO_POWER_TIMEOUT_MS 15000
+
+// 重开 codec（I2S DMA 重配）所需的内部堆下限。堆不足时硬开会触发
+// esp_codec_dev 重配失败后空指针崩溃（LoadProhibited），因此宁可推迟重试：
+// TLS 握手结束后其临时内存会被释放，堆通常在数百毫秒内回升。
+#define AUDIO_HW_REOPEN_MIN_HEAP (24 * 1024)
 #define AUDIO_POWER_CHECK_INTERVAL_MS 1000
 
 #define AS_EVENT_AUDIO_TESTING_RUNNING      (1 << 0)
@@ -124,6 +129,9 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    // 主动关闭 codec 输入/输出，为建连等高内存操作释放内部 RAM；
+    // 之后由 ReadAudioData / 播放路径按需自动重新打开。
+    void SuspendAudioHardware();
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 

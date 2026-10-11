@@ -12,12 +12,18 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
 #define TAG "Application"
+
+// 建连（TCP+TLS）前内部堆余量下限：低于此值时主动关闭音频硬件让路。
+// 实测堆余量 33K 时音频管道可用，4-6K 时静默失效，取 32K 作为阈值。
+#define CONNECT_MIN_FREE_INTERNAL_HEAP (32 * 1024)
 
 
 Application::Application() {
@@ -879,6 +885,16 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
+
+            // 低内存自救：建连要消耗大量内部堆，余量不足时先停止音频采集/播放并
+            // 关闭 codec（释放 I2S DMA 等约 60K），否则连上后音频管道会因分配失败
+            // 静默失效（设备"听得见唤醒、听不见说话"）。进入 listening 后各路径
+            // 会按需自动重新打开。
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < CONNECT_MIN_FREE_INTERNAL_HEAP) {
+                audio_service_.EnableWakeWordDetection(false);
+                audio_service_.EnableVoiceProcessing(false);
+                audio_service_.SuspendAudioHardware();
+            }
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);

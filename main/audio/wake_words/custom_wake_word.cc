@@ -4,6 +4,7 @@
 #include "assets.h"
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
@@ -224,11 +225,17 @@ void CustomWakeWord::EncodeWakeWordData() {
     wake_word_opus_.clear();
     if (wake_word_encode_task_stack_ == nullptr) {
         wake_word_encode_task_stack_ = (StackType_t*)heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
-        assert(wake_word_encode_task_stack_ != nullptr);
+        if (wake_word_encode_task_stack_ == nullptr) {
+            ESP_LOGE(TAG, "wake word encode stack alloc failed, skip encoding");
+            return;
+        }
     }
     if (wake_word_encode_task_buffer_ == nullptr) {
         wake_word_encode_task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-        assert(wake_word_encode_task_buffer_ != nullptr);
+        if (wake_word_encode_task_buffer_ == nullptr) {
+            ESP_LOGE(TAG, "wake word encode task buffer alloc failed, skip encoding");
+            return;
+        }
     }
 
     wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
