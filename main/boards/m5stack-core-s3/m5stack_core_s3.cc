@@ -1586,6 +1586,21 @@ private:
     // 协议（来自 M5Stack/StackChan-BSP）:
     //   REG_LED_CFG  (0x24): 低6位=LED数量, bit6=1 触发刷新
     //   REG_LED_RAM  (0x30+): 颜色数据起点，每颗 LED 2 字节 RGB565 little-endian
+    //   GPIO 寄存器: M=0x03/0x04 方向, PU=0x09/0x0A 上拉, PD=0x0B/0x0C 下拉,
+    //               DRV=0x13/0x14 开漏(1)/推挽(0)；pin>=8 用 _H 寄存器 bit(pin-8)
+
+    bool Py32ReadReg(uint8_t reg, uint8_t* val) {
+        if (!py32_dev_) return false;
+        return i2c_master_transmit_receive(py32_dev_, &reg, 1, val, 1, 200) == ESP_OK;
+    }
+
+    // 读-改-写寄存器指定位（StackChan-BSP 的 bitOn/bitOff 等价物）
+    bool Py32SetRegBit(uint8_t reg, uint8_t bit, bool on) {
+        uint8_t v;
+        if (!Py32ReadReg(reg, &v)) return false;
+        v = on ? (v | (1 << bit)) : (v & ~(1 << bit));
+        return Py32WriteRegBlock(reg, &v, 1);
+    }
 
     void InitializePy32LedDevice() {
         i2c_device_config_t dev_cfg = {
@@ -1598,12 +1613,25 @@ private:
             py32_dev_ = nullptr;
             return;
         }
+        // PY32 引脚 13 是 LED 数据线输出：官方 BSP io_expander_init 里必须配置为
+        // 输出+上拉+推挽，缺了这步 I2C 写入全部 ACK、寄存器全对，但 WS2812 数据线
+        // 保持关断，灯环全灭（本次「灯光秀发送正常却看不到灯」的根因）。
+        // pin13 → _H 寄存器 bit5。
+        Py32SetRegBit(0x04, 5, true);   // GPIO_M_H:  输出模式
+        Py32SetRegBit(0x0A, 5, true);   // GPIO_PU_H: 上拉
+        Py32SetRegBit(0x0C, 5, false);  // GPIO_PD_H: 无下拉
+        Py32SetRegBit(0x14, 5, false);  // GPIO_DRV_H: 推挽
         // 设 LED 数量 = 12
         uint8_t cmd[2] = {0x24, 12};
         i2c_master_transmit(py32_dev_, cmd, 2, 200);
+        // 开机自检闪一下暖橙色（300ms）——灯环物理链路正常的肉眼凭证
+        uint16_t warm[12];
+        for (int i = 0; i < 12; i++) warm[i] = Rgb888To565(255, 120, 0);
+        Py32SetLedFrame(warm, 12);
+        vTaskDelay(pdMS_TO_TICKS(300));
         uint16_t off[12] = {};
         Py32SetLedFrame(off, 12);
-        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
+        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, pin13 output+pu+pp, self-test flashed)");
     }
 
     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
