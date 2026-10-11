@@ -73,6 +73,9 @@ public:
     virtual bool GetTemperature(float& esp32temp);
     virtual Display* GetDisplay();
     virtual Camera* GetCamera();
+    // 拍照前自动追踪对准人（有头部云台的板子实现，时限内尽量把目标转到画面中央）；
+    // 无此能力的板子直接返回 true，不影响拍照流程
+    virtual bool AimCameraAtPerson(int timeout_ms) { (void)timeout_ms; return true; }
     virtual NetworkInterface* GetNetwork() = 0;
     virtual void StartNetwork() = 0;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }

@@ -170,6 +170,27 @@ public:
     float GetYaw() const { return yaw_; }
     float GetPitch() const { return pitch_; }
 
+    // 拍照前调用：让头部云台追踪并对准运动目标（人），超时也返回（保持最后朝向）。
+    // 返回 true=已对准，false=超时未找到/未对准（调用方可照常继续拍照）。
+    bool Aim(int timeout_ms = 1000) {
+        bool was_paused = paused_;
+        if (was_paused) {
+            Resume();
+        }
+        aimed_ = false;
+        aim_stable_ = 0;
+        int waited = 0;
+        while (waited < timeout_ms && !aimed_) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            waited += 50;
+        }
+        if (was_paused) {
+            Pause(true);
+        }
+        ESP_LOGI("FaceTrack", "Aim %s after %d ms", aimed_ ? "locked" : "timeout", waited);
+        return aimed_;
+    }
+
 private:
     static void TaskFunc(void* arg) {
         auto* self = static_cast<FaceTracker*>(arg);
@@ -223,6 +244,11 @@ private:
             if (no_move_count_ > 6 && tracking_) {
                 tracking_ = false;
             }
+            // 跟踪中目标短暂静止：头部已指向目标最后位置，视为已对准（拍照时人常说
+            // 完话就静止，等不到运动不能一直瞄下去）
+            if (tracking_ && no_move_count_ >= 2) {
+                aimed_ = true;
+            }
             return;
         }
 
@@ -251,15 +277,26 @@ private:
         if (pitch_ > 60) pitch_ = 60;
 
         servo_->MoveTo((int)yaw_, (int)pitch_, 150);
+
+        // 瞄准判定：运动质心持续接近画面中心若干帧后视为已对准（供 Aim() 轮询）
+        if (fabsf(smooth_x_) < 0.08f && fabsf(smooth_y_) < 0.08f) {
+            if (++aim_stable_ >= 3) {
+                aimed_ = true;
+            }
+        } else {
+            aim_stable_ = 0;
+        }
     }
 
     EspVideo* camera_ = nullptr;
     StackChanServo* servo_ = nullptr;
     TaskHandle_t task_ = nullptr;
     volatile bool paused_ = false;
+    volatile bool aimed_ = false;
     bool tracking_ = false;
     bool has_prev_ = false;
     int no_move_count_ = 0;
+    int aim_stable_ = 0;
     float yaw_ = 0.0f;
     float pitch_ = 30.0f;
     float smooth_x_ = 0.0f;
@@ -1677,7 +1714,11 @@ private:
         si12t_last_state_ = si12t_dev_ ? Si12tReadReg(0x10) : 0;
 
         int64_t last_touch_time = 0;
-        const int64_t TOUCH_COOLDOWN_US = 5000000;  // 5 秒冷却
+        const int64_t TOUCH_COOLDOWN_US = 30000000;  // 30 秒冷却（防误触刷屏）
+        // 消抖：触摸位需连续成立 STABLE_THRESHOLD 次（100ms 轮询）才算真触摸，
+        // 滤掉电磁干扰造成的瞬时假触发（不碰设备也会每 5 秒"被抚摸"的问题）
+        uint8_t stable_count[3] = {0, 0, 0};
+        const uint8_t STABLE_THRESHOLD = 4;  // ×100ms = 持续按住 400ms
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!si12t_dev_) continue;
@@ -1685,23 +1726,27 @@ private:
             int64_t now = esp_timer_get_time();
             for (int zone = 0; zone < 3; zone++) {
                 uint8_t cur = (out >> (zone * 2)) & 0x03;
-                uint8_t prev = (si12t_last_state_ >> (zone * 2)) & 0x03;
-                if (cur != 0 && prev == 0 && (now - last_touch_time > TOUCH_COOLDOWN_US)) {
-                    static const char* msgs[] = {
-                        "（主人摸了摸小智的头）",
-                        "（主人揉了揉小智的头顶）",
-                        "（主人轻轻拍了拍小智的脑袋）",
-                        "（主人用额头抵着小智的额头蹭了蹭）",
-                        "（主人用手指戳了戳小智的脑门）",
-                        "（主人温柔地抚摸小智的头发）",
-                        "（主人理了理小智的头发）",
-                    };
-                    const char* msg = msgs[esp_random() % 7];
-                    ESP_LOGI(TAG, "SI12T touch -> %s", msg);
-                    SendUserMessage(msg);
-                    last_touch_time = now;
-                    break;
+                if (cur == 0) {
+                    stable_count[zone] = 0;
+                    continue;
                 }
+                if (++stable_count[zone] < STABLE_THRESHOLD) continue;
+                stable_count[zone] = 0;  // 触发后清零：按住不松不会连发，松开重按才算下次
+                if (now - last_touch_time <= TOUCH_COOLDOWN_US) break;
+                static const char* msgs[] = {
+                    "（主人摸了摸小智的头）",
+                    "（主人揉了揉小智的头顶）",
+                    "（主人轻轻拍了拍小智的脑袋）",
+                    "（主人用额头抵着小智的额头蹭了蹭）",
+                    "（主人用手指戳了戳小智的脑门）",
+                    "（主人温柔地抚摸小智的头发）",
+                    "（主人理了理小智的头发）",
+                };
+                const char* msg = msgs[esp_random() % 7];
+                ESP_LOGI(TAG, "SI12T touch ch%d (raw=0x%02x) -> %s", zone, out, msg);
+                SendUserMessage(msg);
+                last_touch_time = now;
+                break;
             }
             si12t_last_state_ = out;
         }
@@ -2249,6 +2294,14 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    // 拍照前自动追踪定位：头部云台先对准人再拍；无云台/相机时直接放行
+    virtual bool AimCameraAtPerson(int timeout_ms) override {
+        if (!servo_ok_ || !camera_ || !camera_->IsOk()) {
+            return true;
+        }
+        return face_tracker_.Aim(timeout_ms);
     }
 
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {

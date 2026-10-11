@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
+#include <esp_heap_caps.h>
 
 #include "application.h"
 #include "display.h"
@@ -108,15 +109,26 @@ void McpServer::AddCommonTools() {
             PropertyList({
                 Property("question", kPropertyTypeString)
             }),
-            [camera](const PropertyList& properties) -> ReturnValue {
+            [&board, camera](const PropertyList& properties) -> ReturnValue {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
+
+                // 内存诊断：拍照各阶段后的内部堆余量（定位拍照后语音失灵的泄漏点）
+                auto heap_now = []() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL); };
+                ESP_LOGI(TAG, "take_photo: free heap %u", heap_now());
+
+                // 拍照前先让头部云台追踪对准人；无云台/超时未对准时直接继续拍
+                board.AimCameraAtPerson(1000);
+                ESP_LOGI(TAG, "take_photo after aim: free heap %u", heap_now());
 
                 if (!camera->Capture()) {
                     throw std::runtime_error("Failed to capture photo");
                 }
+                ESP_LOGI(TAG, "take_photo after capture: free heap %u", heap_now());
                 auto question = properties["question"].value<std::string>();
-                return camera->Explain(question);
+                auto result = camera->Explain(question);
+                ESP_LOGI(TAG, "take_photo after explain: free heap %u", heap_now());
+                return result;
             });
     }
 #endif
