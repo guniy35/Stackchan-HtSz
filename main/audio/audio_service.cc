@@ -1,6 +1,10 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
 #include <cstring>
+
+
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -36,6 +40,32 @@
 #endif
 
 #define TAG "AudioService"
+
+// 内部 RAM 紧张时任务栈分配会失败（opus 任务需 24KB）：
+// 先尝试内部 RAM，失败则回退 PSRAM 栈，再失败打错误日志。
+// 静默失败的后果是"设备能唤醒能触摸但没声音/语音无反应"，极难排查。
+static bool CreateAudioTask(TaskFunction_t code, const char* name, uint32_t stack,
+                            void* param, UBaseType_t prio, TaskHandle_t* handle,
+                            BaseType_t core) {
+    if (core >= 0) {
+        if (xTaskCreatePinnedToCore(code, name, stack, param, prio, handle, core) == pdPASS) {
+            return true;
+        }
+    } else {
+        if (xTaskCreate(code, name, stack, param, prio, handle) == pdPASS) {
+            return true;
+        }
+    }
+    ESP_LOGW(TAG, "Task %s: internal stack alloc failed (free=%u), fallback to PSRAM",
+             name, heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (xTaskCreateWithCaps(code, name, stack, param, prio, handle, MALLOC_CAP_SPIRAM) == pdPASS) {
+        return true;
+    }
+    ESP_LOGE(TAG, "Task %s: creation FAILED (free internal=%u, free psram=%u)",
+             name, heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return false;
+}
 
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
@@ -130,40 +160,45 @@ void AudioService::Start() {
 
 #if CONFIG_USE_AUDIO_PROCESSOR
     /* Start the audio input task */
-    xTaskCreatePinnedToCore([](void* arg) {
+    bool input_ok = CreateAudioTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
     }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
 
     /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    bool output_ok = CreateAudioTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_, -1);
 #else
     /* Start the audio input task */
-    xTaskCreate([](void* arg) {
+    bool input_ok = CreateAudioTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
+    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_, -1);
 
     /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    bool output_ok = CreateAudioTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048, this, 4, &audio_output_task_handle_, -1);
 #endif
 
     /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    bool opus_ok = CreateAudioTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_, -1);
+
+    if (!input_ok || !output_ok || !opus_ok) {
+        ESP_LOGE(TAG, "Audio service started with MISSING tasks (input=%d output=%d opus=%d), voice pipeline broken",
+                 input_ok, output_ok, opus_ok);
+    }
 }
 
 void AudioService::Stop() {
