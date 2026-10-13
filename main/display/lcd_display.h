@@ -11,7 +11,7 @@
 #include <atomic>
 #include <memory>
 
-#define PREVIEW_IMAGE_DURATION_MS 5000
+#define PREVIEW_IMAGE_DURATION_MS 20000  // [本地补丁] 原 5000：日历等全屏预览 5 秒太短，改 20 秒
 
 
 class LcdDisplay : public LvglDisplay {
@@ -35,6 +35,7 @@ protected:
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+    bool preview_hid_bars_ = false;  // [本地补丁] 预览全屏时是否隐藏了顶/底栏，收回时据此恢复
 
     void InitializeLcdThemes();
     virtual bool Lock(int timeout_ms = 0) override;

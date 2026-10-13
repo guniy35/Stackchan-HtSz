@@ -1004,6 +1004,11 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     if (image == nullptr) {
         esp_timer_stop(preview_timer_);
         lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        if (preview_hid_bars_) {  // 只恢复预览前可见的栏，避免空字幕栏闪现
+            preview_hid_bars_ = false;
+            lv_obj_remove_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
@@ -1015,15 +1020,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     preview_image_cached_ = std::move(image);
     auto img_dsc = preview_image_cached_->image_dsc();
     lv_image_set_src(preview_image_, img_dsc);
+    // [本地补丁] 原实现固定半屏预览（对象 width_/2×height_/2 + 50% 缩放），
+    // 日历等全屏画面又小又丑——改为铺满全屏、等比缩放（256=100%），
+    // 预览期间隐藏顶部状态栏和底部字幕栏，像待机时钟面一样整屏显示
+    lv_obj_set_size(preview_image_, width_, height_);
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
-        // zoom factor 0.5
-        lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
+        lv_coord_t scale_w = width_ * 256 / img_dsc->header.w;
+        lv_coord_t scale_h = height_ * 256 / img_dsc->header.h;
+        lv_image_set_scale(preview_image_, scale_w < scale_h ? scale_w : scale_h);
     }
 
-    // Hide emoji_box_
+    // Hide emoji_box_ and bars
     if (gif_controller_) {
         gif_controller_->Stop();
     }
+    preview_hid_bars_ = !lv_obj_has_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     esp_timer_stop(preview_timer_);
